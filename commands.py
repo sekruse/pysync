@@ -1,4 +1,5 @@
-import time, sys, os, datetime, argparse, fnmatch, core
+import time, sys, os, datetime, argparse, fnmatch, core, re
+from collections import defaultdict
 
 def index(args):
     starttime = time.time()
@@ -20,11 +21,82 @@ def clean(args):
     hash_dict = defaultdict(list)
     for fd in index.files:
         hash_dict[fd.sha256].append(fd)
-    for h, fds in hash_dict.iteritems():
+    for h, fds in hash_dict.items():
+        if len(fds) < 2: del hash_dict[h]
         if len(fds) > 1:
             print '{} files with SHA256 {}:'.format(len(fds), h)
             for fd in fds:
                 print '* {}'.format(fd.relpath)
+
+    print 'Detected {} duplicate groups.'.format(len(hash_dict))
+    print 'Enter command:'
+    keep_regex = re.compile('keep (?P<pattern>.*)(?:[\s\n\r]*)')
+    delete_regex = re.compile('delete (?P<pattern>.*)(?:[\s\n\r]*)')
+    ignore_regex = re.compile('ignore (?P<pattern>.*)(?:[\s\n\r]*)')
+    while True:
+        try:
+            line = raw_input('> ')
+        except EOFError:
+            line = ''
+        if not line or line == 'exit':
+            break
+
+        if line == 'show':
+            for h, fds in hash_dict.iteritems():
+                print '{} files with SHA256 {}:'.format(len(fds), h)
+                for fd in fds:
+                    print '* {}'.format(fd.relpath)
+            continue
+
+        match = keep_regex.match(line)
+        if match:
+            pattern = match.group('pattern')
+            for h, fds in hash_dict.items():
+                delete_fds = [fd for fd in fds if not fnmatch.fnmatch(fd.relpath, pattern)]
+                if len(delete_fds) < len(fds):
+                    for delete_fd in delete_fds:
+                        del_path = os.path.join(args.directory, delete_fd.relpath)
+                        print 'Deleting {}...'.format(del_path)
+                        if not args.dryrun:
+                            try: os.remove(del_path)
+                            except OSError:
+                                sys.stderr.write('Could not remove {}.\n', del_path)
+                                sys.stderr.flush()
+                        fds.remove(delete_fd)
+                    if len(fds) < 2: hash_dict[h]
+            continue
+
+        match = ignore_regex.match(line)
+        if match:
+            pattern = match.group('pattern')
+            for h, fds in hash_dict.items():
+                for fd in fds[:]:
+                    if fnmatch.fnmatch(fd.relpath, pattern):
+                        print 'Ignoring {}...'.format(fd.relpath)
+                        fds.remove(fd)
+                if len(fds) < 2: hash_dict[h]
+            continue
+
+        match = delete_regex.match(line)
+        if match:
+            pattern = match.group('pattern')
+            for h, fds in hash_dict.items():
+                delete_fds = [fd for fd in fds if fnmatch.fnmatch(fd.relpath, pattern)]
+                if len(delete_fds) < len(fds):
+                    for delete_fd in delete_fds:
+                        del_path = os.path.join(args.directory, delete_fd.relpath)
+                        print 'Deleting {}...'.format(del_path)
+                        if not args.dryrun:
+                            try: os.remove(del_path)
+                            except OSError:
+                                sys.stderr.write('Could not remove {}.\n', del_path)
+                                sys.stderr.flush()
+                        fds.remove(delete_fd)
+                    if len(fds) < 2: hash_dict[h]
+            continue
+
+        print 'Unknown command.'
+
 
 def sync(args):
     starttime = time.time()
@@ -63,6 +135,7 @@ def main(argv):
     indexparser.add_argument('directory')
     indexparser.set_defaults(func=clean)
     indexparser.add_argument('--excludes', metavar='pattern', nargs='+')
+    indexparser.add_argument('--dry-run', dest='dryrun', action='store_const', const=True, default=False)
 
     syncparser = subparsers.add_parser('sync')
     syncparser.set_defaults(func=sync)
