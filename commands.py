@@ -56,7 +56,7 @@ def clean(args):
                         if not args.dryrun:
                             try: os.remove(del_path)
                             except OSError:
-                                sys.stderr.write('Could not remove {}.\n', del_path)
+                                sys.stderr.write('Could not remove {}.\n'.format(del_path))
                                 sys.stderr.flush()
                         fds.remove(delete_fd)
                     if len(fds) < 2: del hash_dict[h]
@@ -85,7 +85,7 @@ def clean(args):
                         if not args.dryrun:
                             try: os.remove(del_path)
                             except OSError:
-                                sys.stderr.write('Could not remove {}.\n', del_path)
+                                sys.stderr.write('Could not remove {}.\n'.format(del_path))
                                 sys.stderr.flush()
                         fds.remove(delete_fd)
                     if len(fds) < 2: del hash_dict[h]
