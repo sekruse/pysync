@@ -23,10 +23,6 @@ def clean(args):
         hash_dict[fd.sha256].append(fd)
     for h, fds in hash_dict.items():
         if len(fds) < 2: del hash_dict[h]
-        if len(fds) > 1:
-            print '{} files with SHA256 {}:'.format(len(fds), h)
-            for fd in fds:
-                print '* {}'.format(fd.relpath)
 
     print 'Detected {} duplicate groups.'.format(len(hash_dict))
     print 'Enter command:'
@@ -63,7 +59,7 @@ def clean(args):
                                 sys.stderr.write('Could not remove {}.\n', del_path)
                                 sys.stderr.flush()
                         fds.remove(delete_fd)
-                    if len(fds) < 2: hash_dict[h]
+                    if len(fds) < 2: del hash_dict[h]
             continue
 
         match = ignore_regex.match(line)
@@ -74,7 +70,7 @@ def clean(args):
                     if fnmatch.fnmatch(fd.relpath, pattern):
                         print 'Ignoring {}...'.format(fd.relpath)
                         fds.remove(fd)
-                if len(fds) < 2: hash_dict[h]
+                if len(fds) < 2: del hash_dict[h]
             continue
 
         match = delete_regex.match(line)
@@ -92,7 +88,7 @@ def clean(args):
                                 sys.stderr.write('Could not remove {}.\n', del_path)
                                 sys.stderr.flush()
                         fds.remove(delete_fd)
-                    if len(fds) < 2: hash_dict[h]
+                    if len(fds) < 2: del hash_dict[h]
             continue
 
         print 'Unknown command.'
