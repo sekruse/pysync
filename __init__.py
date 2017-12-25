@@ -11,7 +11,7 @@ class FileDescriptor:
         self.sha256 = sha256
 
     def __repr__(self):
-        return 'FileDescriptor({}, mtime={}, size={}, sha256={})'.format(self.relpath, self.mtime, self.size, self.sha256)
+        return 'FileDescriptor({}, mtime={}, size={}, sha256={})'.format(repr(self.relpath), repr(self.mtime), repr(self.size), repr(self.sha256))
 
 class FileIndex:
     def __init__(self, basepath):
@@ -54,10 +54,12 @@ class FileIndex:
 class Archive:
     def __init__(self, path):
         self.path = path
+        self.conn = None
 
     def open(self):
-        conn = sqlite3.connect(self.path)
-        conn.executescript("""
+        self.conn = sqlite3.connect(self.path)
+        self.conn.isolation_level = None
+        self.conn.executescript("""
             create table if not exists file_descriptors (
                 relpath text not null unique,
                 size integer not null,
@@ -65,17 +67,51 @@ class Archive:
                 sha256 blob
             );
         """)
-        conn.commit()
-        return conn
+        self.conn.commit()
+        return self.conn
 
     def load(self):
+        if not self.conn: self.open()
         contents = dict()
-        with self.open() as conn:
-            c = conn.cursor()
-            for path, size, mtime, sha256 in c.execute('select * from file_descriptors;'):
-                contents[path] = FileDescriptor(relpath, mtime, size, sha256)
+        c = self.conn.cursor()
+        for path, size, mtime, sha256 in c.execute('select * from file_descriptors;'):
+            contents[path] = FileDescriptor(relpath, mtime, size, sha256)
         return contents
 
+    def get(self, path):
+        if not self.conn: self.open()
+        row = self.conn.execute('''
+            select size, mtime, sha256 from file_descriptors where relpath = ?;
+        ''', (Archive._make_unicode(path),)).fetchone()
+        return FileDescriptor(path, size=row[0], mtime=row[1], sha256=row[2]) if row else None
+
+    def __getitem__(self, path):
+        return self.get(path)
+
+    def update(self, fd):
+        if not self.conn: self.open()
+        self.conn.execute("""
+            update file_descriptors
+            set size = ?, mtime = ?, sha256 = ?
+            where relpath = ?;
+        """, (fd.size, fd.mtime, fd.sha256, Archive._make_unicode(fd.relpath)))
+
+    def insert(self, fd):
+        if not self.conn: self.open()
+        self.conn.execute("""
+            insert into file_descriptors (relpath, size, mtime, sha256)
+            values (?, ?, ?, ?);
+        """, (Archive._make_unicode(fd.relpath), fd.size, fd.mtime, fd.sha256))
+
+    def close(self):
+        self.conn.close()
+        self.conn = None
+
+    @staticmethod
+    def _make_unicode(path):
+        if type(path) == str: return path.decode('utf-8')
+        elif type(path) == unicode: return path
+        else: raise ValueError('Illegal path: {}'.format(repr(path)))
 
 class ChangeSet:
     def __init__(self):
@@ -96,25 +132,10 @@ class FileFilter:
             if exclude.match(tail): return True
         return False
 
-
-def open_archive(path):
-    if not path: return None
-    conn = sqlite3.connect(path)
-    conn.isolation_level = None
-    conn.executescript("""
-        create table if not exists file_descriptors (
-            relpath text not null unique,
-            size integer not null,
-            mtime real not null,
-            sha256 blob
-        );
-    """)
-    return conn
-
 def create_index(basepath, includes=[], excludes=[], archive_path=None):
-    archive_connection = None
+    archive = None
     try:
-        archive_connection = open_archive(archive_path)
+        if archive_path: archive = Archive(archive_path)
         basepath = os.path.normpath(basepath)
         fileindex = FileIndex(basepath)
         filefilter = FileFilter(includes=includes, excludes=excludes)
@@ -127,41 +148,30 @@ def create_index(basepath, includes=[], excludes=[], archive_path=None):
                 if os.path.isdir(path):
                     for child in os.listdir(path): queue.append(os.path.join(path, child))
                 else:
-                    descriptor = create_descriptor(path, basepath)
-                    row = archive_connection.execute('''
-                        select size, mtime, sha256 from file_descriptors where relpath = ?;
-                    ''', (descriptor.relpath,)).fetchone() if archive_connection else None
-                    if row is None:
+                    fd = create_descriptor(path, basepath)
+                    old_fd = archive[fd.relpath] if archive else None
+                    if not old_fd:
                         sys.stdout.write('Calculating SHA256 for {}... '.format(path))
                         starttime = time.time()
-                        descriptor.sha256 = sha256 = hash.sha256(path)
+                        fd.sha256 = sha256 = hash.sha256(path)
                         sys.stdout.write('({})\n'.format(datetime.timedelta(seconds=time.time()-starttime)))
                         sys.stdout.flush()
-                        if archive_connection is not None:
-                            archive_connection.execute("""
-                                insert into file_descriptors (relpath, size, mtime, sha256)
-                                values (?, ?, ?, ?);
-                            """, (descriptor.relpath.encode('utf-8'), descriptor.size, descriptor.mtime, descriptor.sha256))
-                    elif row[0] != descriptor.size or row[1] != descriptor.mtime:
+                        if archive: archive.insert(fd)
+                    elif old_fd.size != fd.size or old_fd.mtime != fd.mtime:
                         sys.stdout.write('Calculating SHA256 for {}... '.format(path))
                         starttime = time.time()
-                        descriptor.sha256 = sha256 = hash.sha256(path)
+                        fd.sha256 = sha256 = hash.sha256(path)
                         sys.stdout.write('({})\n'.format(datetime.timedelta(seconds=time.time()-starttime)))
                         sys.stdout.flush()
-                        archive_connection.execute("""
-                            update file_descriptors
-                            set size = ?, mtime = ?, sha256 = ?
-                            where relpath = ?;
-                        """, (descriptor.size, descriptor.mtime, descriptor.sha256, descriptor.relpath.encode('utf-8')))
+                        if archive: archive.update(fd)
                     else:
-                        descriptor.sha256 = row[2]
-                    fileindex.files.append(descriptor)
-                    # print descriptor
-            except StandardError as e:
+                        fd.sha256 = old_fd.sha256
+                    fileindex.files.append(fd)
+            except (EnvironmentError, SystemError) as e:
                 sys.stderr.write('Could not process {}: {}\n'.format(path, e))
                 sys.stderr.flush()
     finally:
-        if archive_connection: archive_connection.close()
+        if archive: archive.close()
     return fileindex
 
 def split_path(path):
