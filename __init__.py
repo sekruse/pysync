@@ -202,7 +202,25 @@ if __name__ == '__main__':
         if args.excludes: excludes += map(fnmatch.translate, args.excludes)
         index1 = create_index(args.directory, excludes=excludes, archive_path=os.path.join(args.directory, '.pysync'))
         elapsedtime = datetime.timedelta(seconds=time.time() - starttime)
-        print 'Created index with {} files in {}.'.format(len(index1.files), elapsedtime)
+        print 'Loaded index with {} files in {}.'.format(len(index1.files), elapsedtime)
+
+
+    def clean(args):
+        starttime = time.time()
+        excludes = [fnmatch.translate('.pysync')]
+        if args.excludes: excludes += map(fnmatch.translate, args.excludes)
+        index = create_index(args.directory, excludes=excludes, archive_path=os.path.join(args.directory, '.pysync'))
+        elapsedtime = datetime.timedelta(seconds=time.time() - starttime)
+        print 'Loaded index with {} files in {}.'.format(len(index.files), elapsedtime)
+
+        hash_dict = defaultdict(list)
+        for fd in index.files:
+            hash_dict[fd.sha256].append(fd)
+        for h, fds in hash_dict.iteritems():
+            if len(fds) > 1:
+                print '{} files with SHA256 {}:'.format(len(fds), h)
+                for fd in fds:
+                    print '* {}'.format(fd.relpath)
 
     def sync(args):
         starttime = time.time()
@@ -210,11 +228,11 @@ if __name__ == '__main__':
         if args.excludes: excludes += map(fnmatch.translate, args.excludes)
         index1 = create_index(args.source, excludes=excludes, archive_path=os.path.join(args.source, '.pysync'))
         elapsedtime = datetime.timedelta(seconds=time.time() - starttime)
-        print 'Created index with {} files in {}.'.format(len(index1.files), elapsedtime)
+        print 'Loaded index with {} files in {}.'.format(len(index1.files), elapsedtime)
 
         index2 = create_index(args.target, excludes=excludes, archive_path=os.path.join(args.target, '.pysync'))
         elapsedtime = datetime.timedelta(seconds=time.time() - starttime)
-        print 'Created index with {} files in {}.'.format(len(index2.files), elapsedtime)
+        print 'Loaded index with {} files in {}.'.format(len(index2.files), elapsedtime)
 
         changeset = index1.compare(index2)
         print '{} new files:'.format(len(changeset.new_files))
@@ -234,6 +252,11 @@ if __name__ == '__main__':
     indexparser = subparsers.add_parser('index')
     indexparser.add_argument('directory')
     indexparser.set_defaults(func=index)
+    indexparser.add_argument('--excludes', metavar='pattern', nargs='+')
+
+    indexparser = subparsers.add_parser('clean')
+    indexparser.add_argument('directory')
+    indexparser.set_defaults(func=clean)
     indexparser.add_argument('--excludes', metavar='pattern', nargs='+')
 
     syncparser = subparsers.add_parser('sync')
