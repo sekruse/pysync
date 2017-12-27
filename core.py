@@ -1,4 +1,5 @@
-import hash, os, re, sqlite3, sys, time, datetime
+import hash, os, re, sqlite3, sys, time, datetime, difflib, shutil
+from collections import defaultdict
 
 class FileDescriptor:
     def __init__(self, relpath, mtime, size, sha256=None):
@@ -23,30 +24,45 @@ class FileIndex:
     def create_path_index(self):
         return dict([(d.relpath, d) for d in self.files])
 
-    def compare(self, other):
+    def compare(self, target):
         changeset = ChangeSet()
-        other_index = other.create_path_index()
-        deleted_files = []
-        for f in self.files:
-            if f.relpath in other_index:
-                other_f = other_index[f.relpath]
-                if f.size != other_f.size or f.sha256 != other_f.sha256:
-                    changeset.file_changes.append((f, other_f))
-                del other_index[f.relpath]
-            else:
-                deleted_files.append(f)
+        target_index = target.create_path_index()
+
+        # Match source to target files by name.
         new_files = defaultdict(list)
-        for new_f in other_index.itervalues():
-            new_files[new_f.sha256].append(new_f)
-        for deleted_f in deleted_files:
-            new_fs = new_files[deleted_f.sha256]
-            if new_fs:
-                changeset.file_changes.append(deleted, new_fs.pop())
+        for fd in self.files:
+            if fd.relpath in target_index:
+                target_fd = target_index[fd.relpath]
+                if fd.size != target_fd.size or fd.sha256 != target_fd.sha256:
+                    changeset.file_changes.append((fd, target_fd))
+                del target_index[fd.relpath]
             else:
-                changeset.deleted_files.append(deleted_f)
-        for new_fs in new_files.itervalues():
-            changeset.new_files += new_fs
+                new_files[fd.sha256].append(fd)
+
+        # Find unmatched target files.
+        deleted_files = defaultdict(list)
+        for del_fd in target_index.itervalues():
+            deleted_files[del_fd.sha256].append(del_fd)
+
+        # Match unmatched files by content.
+        for del_fds in deleted_files.values():
+            sha256 = del_fds[0].sha256
+            new_fds = new_files[sha256]
+            if not new_fds: continue
+            del new_files[sha256]
+            del deleted_files[sha256]
+            matches, remnant_new_fds, remnant_del_fds = fuzzy_match_names(new_fds, del_fds)
+            for match in matches: changeset.file_moves.append(match)
+            for fd in remnant_new_fds: changeset.new_files.append(fd)
+            for fd in remnant_del_fds: changeset.removed_files.append(fd)
+
+        # Find still unmatched source and target files.
+        for new_fds in new_files.itervalues():
+            changeset.new_files += new_fds
+        for del_fds in deleted_files.itervalues():
+            changeset.removed_files += del_fds
         return changeset
+
 
 class Archive:
     def __init__(self, path):
@@ -93,8 +109,17 @@ class Archive:
             where relpath = ?;
         """, (fd.size, fd.mtime, fd.sha256, Archive._make_unicode(fd.relpath)))
 
+    def delete(self, fd):
+        if not self.conn: self.open()
+        self.conn.execute("""
+            delete
+            from file_descriptors
+            where relpath = ?;
+        """, (Archive._make_unicode(fd.relpath),))
+
     def insert(self, fd):
         if not self.conn: self.open()
+        self.delete(fd)
         self.conn.execute("""
             insert into file_descriptors (relpath, size, mtime, sha256)
             values (?, ?, ?, ?);
@@ -116,6 +141,7 @@ class ChangeSet:
         self.removed_files = []
         self.new_files = []
         self.file_changes = []
+        self.file_moves = []
 
 
 class FileFilter:
@@ -130,46 +156,41 @@ class FileFilter:
             if exclude.match(tail): return True
         return False
 
-def create_index(basepath, includes=[], excludes=[], archive_path=None):
-    archive = None
-    try:
-        if archive_path: archive = Archive(archive_path)
-        basepath = os.path.normpath(basepath)
-        fileindex = FileIndex(basepath)
-        filefilter = FileFilter(includes=includes, excludes=excludes)
-        # Read the files in the directory.
-        queue = [basepath]
-        while len(queue) > 0:
-            path = queue.pop()
-            if filefilter.is_filtered(path): continue
-            try:
-                if os.path.isdir(path):
-                    for child in os.listdir(path): queue.append(os.path.join(path, child))
+def create_index(basepath, includes=[], excludes=[], archive=None):
+    basepath = os.path.normpath(basepath)
+    fileindex = FileIndex(basepath)
+    filefilter = FileFilter(includes=includes, excludes=excludes)
+    # Read the files in the directory.
+    queue = [basepath]
+    while len(queue) > 0:
+        path = queue.pop()
+        if filefilter.is_filtered(path): continue
+        try:
+            if os.path.isdir(path):
+                for child in os.listdir(path): queue.append(os.path.join(path, child))
+            else:
+                fd = create_descriptor(path, basepath)
+                old_fd = archive[fd.relpath] if archive else None
+                if not old_fd:
+                    sys.stdout.write('Calculating SHA256 for {}... '.format(path))
+                    starttime = time.time()
+                    fd.sha256 = sha256 = hash.sha256(path)
+                    sys.stdout.write('({})\n'.format(datetime.timedelta(seconds=time.time()-starttime)))
+                    sys.stdout.flush()
+                    if archive: archive.insert(fd)
+                elif old_fd.size != fd.size or old_fd.mtime != fd.mtime:
+                    sys.stdout.write('Calculating SHA256 for {}... '.format(path))
+                    starttime = time.time()
+                    fd.sha256 = sha256 = hash.sha256(path)
+                    sys.stdout.write('({})\n'.format(datetime.timedelta(seconds=time.time()-starttime)))
+                    sys.stdout.flush()
+                    if archive: archive.update(fd)
                 else:
-                    fd = create_descriptor(path, basepath)
-                    old_fd = archive[fd.relpath] if archive else None
-                    if not old_fd:
-                        sys.stdout.write('Calculating SHA256 for {}... '.format(path))
-                        starttime = time.time()
-                        fd.sha256 = sha256 = hash.sha256(path)
-                        sys.stdout.write('({})\n'.format(datetime.timedelta(seconds=time.time()-starttime)))
-                        sys.stdout.flush()
-                        if archive: archive.insert(fd)
-                    elif old_fd.size != fd.size or old_fd.mtime != fd.mtime:
-                        sys.stdout.write('Calculating SHA256 for {}... '.format(path))
-                        starttime = time.time()
-                        fd.sha256 = sha256 = hash.sha256(path)
-                        sys.stdout.write('({})\n'.format(datetime.timedelta(seconds=time.time()-starttime)))
-                        sys.stdout.flush()
-                        if archive: archive.update(fd)
-                    else:
-                        fd.sha256 = old_fd.sha256
-                    fileindex.files.append(fd)
-            except (EnvironmentError, SystemError) as e:
-                sys.stderr.write('Could not process {}: {}\n'.format(path, e))
-                sys.stderr.flush()
-    finally:
-        if archive: archive.close()
+                    fd.sha256 = old_fd.sha256
+                fileindex.files.append(fd)
+        except (EnvironmentError, SystemError) as e:
+            sys.stderr.write('Could not process {}: {}\n'.format(path, e))
+            sys.stderr.flush()
     return fileindex
 
 def split_path(path):
@@ -190,3 +211,52 @@ def create_descriptor(path, basepath):
     if not os.path.isfile(path): raise ValueError('Not a file: {}'.format(path))
     stat = os.stat(path)
     return FileDescriptor(relpath=os.path.relpath(path, basepath), mtime=stat.st_mtime, size=stat.st_size)
+
+def fuzzy_match_names(fds1, fds2):
+    result = []
+    matches = []
+    remnant_fds1 = set(fds1)
+    remnant_fds2 = set(fds2)
+    for fd1 in fds1:
+        for fd2 in fds2:
+            matches.append((fd1, fd2, difflib.SequenceMatcher(None, fd1.relpath, fd2.relpath).ratio()))
+    matches.sort(cmp=lambda a, b: a - b, key=lambda e: e[2], reverse=True)
+    while remnant_fds1 and remnant_fds2:
+        while True:
+            fd1, fd2, ratio = matches.pop()
+            if ratio == 0: break
+            if fd1 in remnant_fds1 and fd2 in remnant_fds2:
+                remnant_fds1.discard(fd1)
+                remnant_fds2.discard(fd2)
+                break
+        result.append((fd1, fd2))
+    return result, remnant_fds1, remnant_fds2
+
+def copy(source_path, target_path, overwrite=False):
+    if not overwrite and os.path.exists(target_path):
+        raise OSError('Cannot copy {} to {}: target file exists'.format(source_path, target_path))
+    if os.path.isdir(target_path):
+        raise OSError('Cannot copy {} to {}: target is an existing directory'.format(source_path, target_path))
+    target_dir = os.path.dirname(target_path)
+    if not os.path.exists(target_dir): os.makedirs(target_dir)
+    if overwrite: os.remove(target_path)
+    shutil.copy(source_path, target_path)
+
+def move(source_path, target_path, overwrite=False):
+    if not overwrite and os.path.exists(target_path):
+        raise OSError('Cannot move {} to {}: target file exists'.format(source_path, target_path))
+    if os.path.isdir(target_path):
+        raise OSError('Cannot move {} to {}: target is an existing directory'.format(source_path, target_path))
+    target_dir = os.path.dirname(target_path)
+    if not os.path.exists(target_dir): os.makedirs(target_dir)
+    if overwrite: os.remove(target_path)
+    os.rename(source_path, target_path)
+
+def find_archive(path, archive_file='.pysync'):
+    while True:
+        if os.path.isdir(path):
+            candidate = os.path.join(path, archive_file)
+            if os.path.isfile(candidate): return candidate
+        head, tail = os.path.split(path)
+        if not tail: return None
+        path = head
